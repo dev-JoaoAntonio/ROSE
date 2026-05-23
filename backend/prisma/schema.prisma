@@ -1,0 +1,418 @@
+// Tele ROSE — schema do banco de dados
+//
+// Convenções:
+// - Todos os identificadores externos (expostos em URLs, nomes de arquivo, payloads
+//   mobile) usam UUID v4. Nunca expor IDs sequenciais ou dados pessoais.
+// - Tabelas com dado clínico/pessoal vivem no schema `public` com RLS habilitada
+//   (policies definidas em migrações SQL custom — Prisma só conhece a estrutura).
+// - O schema `auth` é gerenciado pelo Supabase Auth; aqui só referenciamos via FK.
+// - Audit log é append-only por RLS — nunca UPDATE/DELETE.
+//
+// Convenção de tempo:
+// - Todo `createdAt` / `updatedAt` é `timestamptz` (UTC). Carimbos NTP do
+//   Observatório Nacional ficam em campos `*NtpAt` separados, gerados pelo backend.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Prisma 7+: a URL fica em `prisma.config.ts` para migrations, e o
+  // PrismaClient em runtime usa um driver adapter (ver src/prisma/prisma.service.ts).
+}
+
+/// ============================================================
+/// Identidade e organizações
+/// ============================================================
+
+/// Hospital ou clínica parceira que opera um ponto de coleta.
+model Hospital {
+  id             String                 @id @default(uuid()) @db.Uuid
+  name           String                 @db.VarChar(160)
+  cnpj           String                 @unique @db.VarChar(14)
+  city           String                 @db.VarChar(80)
+  state          String                 @db.VarChar(2)
+  contractStatus HospitalContractStatus @default(PILOT)
+  createdAt      DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime               @updatedAt @db.Timestamptz(6)
+
+  devices        Device[]
+  cases          Case[]
+  reagentBatches ReagentBatch[]
+  memberships    Membership[]
+  patients       Patient[]
+
+  @@map("hospitals")
+}
+
+enum HospitalContractStatus {
+  PILOT // operando sob Acordo de Cooperação e Validação Científica
+  ACTIVE // contrato comercial vigente
+  SUSPENDED
+  TERMINATED
+
+  @@map("hospital_contract_status")
+}
+
+/// Perfil de aplicação ligado ao usuário do Supabase Auth.
+/// O ID é o mesmo do `auth.users.id` (UUID gerado pelo Supabase).
+model UserProfile {
+  id                   String   @id @db.Uuid
+  fullName             String   @db.VarChar(160)
+  cpf                  String   @unique @db.VarChar(11) // criptografar via pgcrypto na coluna real
+  professionalRegistry String?  @db.VarChar(40) // CRM / COREN / outro
+  role                 UserRole
+  createdAt            DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @db.Timestamptz(6)
+
+  memberships    Membership[]
+  collectedCases Case[]       @relation("CollectedBy")
+  reviewedCases  Case[]       @relation("ReviewedBy")
+  auditLogs      AuditLog[]
+
+  @@map("user_profiles")
+}
+
+enum UserRole {
+  TECNICO // coletor no hospital
+  PATOLOGISTA // emite veredito
+  ADMIN // operador da Tele ROSE
+  AUDITOR // leitura de audit log, nunca clínico
+  HOSPITAL_DIRECTOR // BI/relatórios, sem acesso clínico
+
+  @@map("user_role")
+}
+
+/// Vínculo de um usuário com um hospital (1:N — um técnico pode atender vários hospitais).
+model Membership {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  hospitalId String   @db.Uuid
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  user     UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hospital Hospital    @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, hospitalId])
+  @@index([hospitalId])
+  @@map("memberships")
+}
+
+/// ============================================================
+/// Hardware homologado
+/// ============================================================
+
+/// Modelo de smartphone homologado, com fator µm/pixel calibrado.
+/// Calibração é feita uma única vez no QG e propagada por modelo.
+model DeviceModel {
+  id              String         @id @default(uuid()) @db.Uuid
+  manufacturer    String         @db.VarChar(40) // "Apple" | "Samsung" | etc
+  model           String         @db.VarChar(80) // "iPhone 15 Pro"
+  platform        DevicePlatform
+  micronsPerPixel Decimal        @db.Decimal(8, 6) // ex: 0.084000
+  calibratedAt    DateTime       @db.Timestamptz(6)
+  calibratedBy    String         @db.Uuid // user_profiles.id do calibrador
+  notes           String?
+  createdAt       DateTime       @default(now()) @db.Timestamptz(6)
+
+  devices Device[]
+
+  @@unique([manufacturer, model])
+  @@map("device_models")
+}
+
+enum DevicePlatform {
+  IOS
+  ANDROID
+
+  @@map("device_platform")
+}
+
+/// Aparelho físico em campo (uma das 18 unidades piloto, por exemplo).
+model Device {
+  id          String       @id @default(uuid()) @db.Uuid
+  serial      String       @unique @db.VarChar(80) // serial do smartphone
+  modelId     String       @db.Uuid
+  hospitalId  String       @db.Uuid
+  dipleSerial String       @db.VarChar(80) // serial da lente DIPLE II
+  status      DeviceStatus @default(ACTIVE)
+  createdAt   DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime     @updatedAt @db.Timestamptz(6)
+
+  model    DeviceModel @relation(fields: [modelId], references: [id])
+  hospital Hospital    @relation(fields: [hospitalId], references: [id])
+  cases    Case[]
+
+  @@index([hospitalId])
+  @@map("devices")
+}
+
+enum DeviceStatus {
+  ACTIVE
+  MAINTENANCE
+  RETIRED
+
+  @@map("device_status")
+}
+
+/// Lote de corante registrado pelo hospital (rastreabilidade ANVISA RDC 786/2023).
+model ReagentBatch {
+  id           String   @id @default(uuid()) @db.Uuid
+  hospitalId   String   @db.Uuid
+  batchCode    String   @db.VarChar(80)
+  reagentName  String   @db.VarChar(120) // ex: "Diff-Quik", "Papanicolaou"
+  manufacturer String   @db.VarChar(120)
+  expiresAt    DateTime @db.Date
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  hospital Hospital @relation(fields: [hospitalId], references: [id])
+  cases    Case[]
+
+  @@unique([hospitalId, batchCode])
+  @@index([hospitalId, active])
+  @@map("reagent_batches")
+}
+
+/// ============================================================
+/// Pacientes e casos
+/// ============================================================
+
+/// Dados pessoais do paciente. Colunas sensíveis devem ser criptografadas
+/// em repouso via Supabase Vault / pgcrypto. Em URLs e nomes de arquivo,
+/// usar sempre o `id` (UUID), nunca CPF ou nome.
+model Patient {
+  id                   String   @id @default(uuid()) @db.Uuid
+  hospitalId           String   @db.Uuid // hospital onde foi cadastrado
+  externalRecordNumber String?  @db.VarChar(80) // n° do prontuário no HIS do hospital
+  // Os 4 campos abaixo são pessoais sensíveis — devem ser cifrados via pgcrypto
+  // ou Supabase Vault (a coluna real no Postgres pode ser `bytea` + view).
+  fullName             String   @db.VarChar(200)
+  cpf                  String   @db.VarChar(11)
+  birthDate            DateTime @db.Date
+  contactPhone         String?  @db.VarChar(20)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  hospital Hospital @relation(fields: [hospitalId], references: [id])
+  cases    Case[]
+
+  @@index([hospitalId])
+  @@map("patients")
+}
+
+/// Caso clínico — uma PAAF avaliada via ROSE.
+/// Ciclo: OPENED → IN_CAPTURE → IN_REVIEW → VERDICT_ISSUED → CLOSED.
+model Case {
+  id                 String       @id @default(uuid()) @db.Uuid
+  caseNumber         String       @unique @db.VarChar(20) // ex: "TR-2026-0001", legível para humanos
+  patientId          String       @db.Uuid
+  hospitalId         String       @db.Uuid
+  deviceId           String       @db.Uuid
+  reagentBatchId     String       @db.Uuid
+  collectedById      String       @db.Uuid // técnico
+  reviewedById       String?      @db.Uuid // patologista
+  anatomicSite       String       @db.VarChar(120) // ex: "Tireoide — lobo direito"
+  clinicalIndication String?      @db.Text
+
+  status       CaseStatus   @default(OPENED)
+  verdict      CaseVerdict?
+  verdictNotes String?      @db.Text // obrigatório se INSATISFATORIA
+  geoLat       Decimal?     @db.Decimal(10, 7)
+  geoLng       Decimal?     @db.Decimal(10, 7)
+
+  openedAtNtp   DateTime  @db.Timestamptz(6) // carimbado pelo backend via NTP
+  capturedAtNtp DateTime? @db.Timestamptz(6)
+  reviewedAtNtp DateTime? @db.Timestamptz(6)
+  closedAtNtp   DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  patient         Patient         @relation(fields: [patientId], references: [id])
+  hospital        Hospital        @relation(fields: [hospitalId], references: [id])
+  device          Device          @relation(fields: [deviceId], references: [id])
+  reagentBatch    ReagentBatch    @relation(fields: [reagentBatchId], references: [id])
+  collectedBy     UserProfile     @relation("CollectedBy", fields: [collectedById], references: [id])
+  reviewedBy      UserProfile?    @relation("ReviewedBy", fields: [reviewedById], references: [id])
+  mediaAssets     MediaAsset[]
+  integrityHashes IntegrityHash[]
+  liveSessions    LiveSession[]
+  report          CaseReport?
+
+  @@index([hospitalId, status])
+  @@index([reviewedById, status])
+  @@index([status, openedAtNtp])
+  @@map("cases")
+}
+
+enum CaseStatus {
+  OPENED // caso criado, ainda sem mídia
+  IN_CAPTURE // técnico capturando / streamando
+  IN_REVIEW // patologista assumiu, ainda sem veredito
+  VERDICT_ISSUED // veredito emitido, PDF gerado
+  CLOSED // caso selado com Hash 2
+
+  @@map("case_status")
+}
+
+enum CaseVerdict {
+  SATISFATORIA
+  INSATISFATORIA
+
+  @@map("case_verdict")
+}
+
+/// ============================================================
+/// Mídia e integridade
+/// ============================================================
+
+/// Arquivo de mídia capturado (foto, Z-stack ou vídeo).
+/// O arquivo real vive no Supabase Storage; aqui guardamos metadados.
+model MediaAsset {
+  id          String    @id @default(uuid()) @db.Uuid
+  caseId      String    @db.Uuid
+  kind        MediaKind
+  storagePath String    @db.VarChar(500) // chave no bucket Supabase
+  mimeType    String    @db.VarChar(80)
+  sizeBytes   BigInt
+  durationMs  Int? // p/ vídeo
+  widthPx     Int?
+  heightPx    Int?
+
+  // Metadados de captura padronizados (regra LABMOB PRO)
+  iso           Int?
+  shutterUs     Int? // shutter em microssegundos
+  whiteBalanceK Int? // temperatura de cor em Kelvin
+  focusLocked   Boolean @default(false)
+
+  // C2PA — manifesto do arquivo (JSON-LD assinado, conforme padrão da Coalition).
+  c2paManifest Json?
+
+  capturedAtNtp DateTime @db.Timestamptz(6)
+  uploadedAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  case            Case            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  integrityHashes IntegrityHash[]
+
+  @@index([caseId])
+  @@map("media_assets")
+}
+
+enum MediaKind {
+  PHOTO
+  ZSTACK
+  VIDEO
+  LIVE_RECORDING // gravação local resultante do streaming
+
+  @@map("media_kind")
+}
+
+/// Hashes SHA-256 da cadeia de custódia.
+/// Hash 1 (INGEST): gerado no upload de cada mídia (vincula a MediaAsset).
+/// Hash 2 (SEAL): gerado no fechamento do caso (vincula a Case, combinando todas as mídias + veredito).
+model IntegrityHash {
+  id            String            @id @default(uuid()) @db.Uuid
+  caseId        String            @db.Uuid
+  mediaAssetId  String?           @db.Uuid // null quando é o Hash 2 (vínculo a Case)
+  kind          IntegrityHashKind
+  sha256        String            @db.Char(64) // hex, 64 caracteres
+  algorithm     String            @default("SHA-256") @db.VarChar(20)
+  computedAtNtp DateTime          @db.Timestamptz(6)
+  computedBy    String            @db.VarChar(80) // identificação do worker que computou
+  createdAt     DateTime          @default(now()) @db.Timestamptz(6)
+
+  case       Case        @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  mediaAsset MediaAsset? @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@index([sha256])
+  @@map("integrity_hashes")
+}
+
+enum IntegrityHashKind {
+  INGEST // Hash 1 — arquivo bruto no upload
+  SEAL // Hash 2 — fechamento do caso (mídia + veredito)
+
+  @@map("integrity_hash_kind")
+}
+
+/// Sessão de streaming ao vivo (LiveKit).
+/// Vincula o caso ao identificador da room/track no LiveKit para auditoria.
+model LiveSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  caseId           String    @db.Uuid
+  livekitRoom      String    @db.VarChar(120)
+  livekitToken     String?   @db.VarChar(500) // efêmero, expira
+  startedAtNtp     DateTime  @db.Timestamptz(6)
+  endedAtNtp       DateTime? @db.Timestamptz(6)
+  participantCount Int       @default(0)
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@map("live_sessions")
+}
+
+/// PDF final do laudo com marca d'água e disclaimer fixo.
+model CaseReport {
+  id          String   @id @default(uuid()) @db.Uuid
+  caseId      String   @unique @db.Uuid
+  storagePath String   @db.VarChar(500)
+  sealHash    String   @db.Char(64) // referência ao Hash 2
+  issuedAtNtp DateTime @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@map("case_reports")
+}
+
+/// ============================================================
+/// Auditoria
+/// ============================================================
+
+/// Append-only por RLS. Toda ação relevante (acesso a caso, abertura de mídia,
+/// emissão de veredito, login, export) escreve aqui.
+model AuditLog {
+  id            BigInt      @id @default(autoincrement())
+  occurredAtNtp DateTime    @db.Timestamptz(6)
+  actorId       String?     @db.Uuid
+  actorRole     UserRole?
+  action        AuditAction
+  resourceType  String      @db.VarChar(60) // ex: "case", "media_asset", "patient"
+  resourceId    String?     @db.Uuid
+  ip            String?     @db.Inet
+  userAgent     String?     @db.VarChar(400)
+  metadata      Json?
+  createdAt     DateTime    @default(now()) @db.Timestamptz(6)
+
+  actor UserProfile? @relation(fields: [actorId], references: [id])
+
+  @@index([occurredAtNtp])
+  @@index([actorId, occurredAtNtp])
+  @@index([resourceType, resourceId])
+  @@map("audit_log")
+}
+
+enum AuditAction {
+  LOGIN
+  LOGOUT
+  CASE_OPEN
+  CASE_VIEW
+  CASE_UPDATE
+  MEDIA_UPLOAD
+  MEDIA_VIEW
+  VERDICT_ISSUED
+  REPORT_GENERATED
+  REPORT_DOWNLOAD
+  PATIENT_EXPORT // LGPD Art. 18
+  ROLE_GRANTED
+  ROLE_REVOKED
+
+  @@map("audit_action")
+}

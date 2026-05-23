@@ -17,4 +17,5 @@
 | Adobe Lightroom descartado (captura em app próprio) | Fechada | [briefing-filtrado.md §7](briefing/briefing-filtrado.md) |
 | Visão computacional desde o início (OpenCV → YOLO) | Fechada | [briefing-filtrado.md §3.3](briefing/briefing-filtrado.md) |
 | Framework do dashboard web | Provisório (Next.js) | [arquitetura.md](architecture/arquitetura.md) |
-| Framework HTTP do backend (Fastify vs Express vs Hono) | Aberta | — |
+| Framework backend: **NestJS** sobre adapter Fastify | Fechada | [arquitetura.md](architecture/arquitetura.md) |
+| ORM: **Prisma** (schema versionado + migrations) | Fechada | [arquitetura.md](architecture/arquitetura.md) |

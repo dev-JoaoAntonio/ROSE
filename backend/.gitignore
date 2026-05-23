@@ -1,0 +1,11 @@
+node_modules
+dist
+coverage
+
+# Env locais — nunca commitar
+.env
+.env.local
+.env.*.local
+
+# Prisma — client é gerado via postinstall
+/generated/prisma

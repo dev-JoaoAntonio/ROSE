@@ -22,7 +22,7 @@ Comece por [docs/README.md](docs/README.md).
 ## Stack
 
 - **Mobile:** Swift (iOS) + Kotlin (Android), nativos
-- **Backend:** Node.js + TypeScript
+- **Backend:** NestJS + Fastify adapter + TypeScript
 - **BaaS:** Supabase (sa-east-1)
 - **Streaming ao vivo:** LiveKit
 - **Dashboard:** Next.js + TypeScript

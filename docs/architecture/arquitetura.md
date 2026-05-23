@@ -40,6 +40,20 @@
    └────────────────────────────────────────┘
 ```
 
+## Divisão Prisma ↔ Supabase
+
+| Responsabilidade | Owner | Mecanismo |
+|---|---|---|
+| Schema da aplicação (cases, patients, devices, audit_log, batches) | **Prisma** | `schema.prisma` + migrations versionadas no Git |
+| Autenticação de usuários | **Supabase Auth** | Prisma referencia `auth.users` como FK |
+| Row Level Security (policies LGPD) | **SQL raw dentro de migrations Prisma** | `prisma/migrations/*/migration.sql` |
+| Armazenamento de mídia | **Supabase Storage** | Policies de bucket via SQL |
+| Notificação em tempo real ao dashboard | **Supabase Realtime** | Habilitada nas tabelas correspondentes |
+
+**Modelo de segurança:**
+- Apps mobile (iOS/Android) → falam **direto com Supabase** via Supabase SDK, autenticados com JWT do usuário → passam por **RLS** (segurança aplicada no banco, independente do cliente).
+- Backend NestJS → usa Prisma com `service_role` (bypassa RLS) → segurança aplicada por **Guards + Interceptors** do NestJS (auth, role, audit log).
+
 ## Por que Supabase
 
 - **Auth + Row Level Security:** controle de acesso por linha do banco — ideal para "técnico só vê seus casos, patologista só vê fila dele". Atende LGPD sem código extra.
@@ -81,7 +95,8 @@ Edge Functions do Supabase têm timeout curto e observabilidade limitada — nã
 |---|---|
 | App iOS | Swift 5.9+, AVFoundation (câmera), OpenCV-iOS, c2pa-rs binding |
 | App Android | Kotlin, CameraX, OpenCV4Android, c2pa-rs binding via JNI |
-| Backend API/workers | Node.js 20 LTS, TypeScript, Fastify (a confirmar), BullMQ (filas) |
+| Backend API/workers | Node.js 20 LTS, TypeScript, **NestJS** com adapter **Fastify**, BullMQ (filas) via `@nestjs/bullmq` |
+| ORM | **Prisma** (gerencia schema da aplicação + migrations versionadas) |
 | BaaS | Supabase (sa-east-1) |
 | Streaming ao vivo | LiveKit (self-hosted ou cloud) |
 | Dashboard web | Next.js 14+ (App Router), TypeScript, Tailwind |
